@@ -1,0 +1,4 @@
+aiogram>=3.4,<4
+aiohttp>=3.9
+openpyxl>=3.1
+tzdata
