@@ -7,7 +7,8 @@ import math
 import re
 from collections import defaultdict
 
-from report import fmt_min, money, short, status
+import report as _rep
+from report import fmt_min, money, short, status, VISIT_CAP_MIN
 
 E = lambda x: html.escape(str(x), quote=False)
 
@@ -40,6 +41,18 @@ def _sum_by(orders):
     return per_agent_day, per_day
 
 
+def _client_sums(orders, since):
+    """{agent_id: {mijoz_nomi: summa}} — filial/ofis yukini mijozlar kesimida ko'rish uchun."""
+    out = defaultdict(lambda: defaultdict(float))
+    for o in orders:
+        if order_date(o) < since:
+            continue
+        aid = (o.get("agent") or {}).get("SD_id")
+        c = (o.get("client") or {}).get("clientName") or (o.get("client") or {}).get("SD_id") or "—"
+        out[aid][c] += float(o.get("totalSummaAfterDiscount") or o.get("totalSumma") or 0)
+    return out
+
+
 async def collect_history(client, day, statuses):
     first = day.replace(day=1)
     start = min(first, day - dt.timedelta(days=7))
@@ -48,7 +61,8 @@ async def collect_history(client, day, statuses):
     pm_end = pm_first.replace(day=min(day.day, pm_last.day))
     cur = await _fetch_range(client, start, day, statuses)
     prev = await _fetch_range(client, pm_first, pm_end, statuses)
-    return {"cur": _sum_by(cur), "prev": _sum_by(prev), "first": first, "day": day}
+    return {"cur": _sum_by(cur), "prev": _sum_by(prev), "first": first, "day": day,
+            "cur_c": _client_sums(cur, str(first)), "prev_c": _client_sums(prev, "")}
 
 
 def _metrics(hist):
@@ -69,6 +83,9 @@ def _metrics(hist):
 
 
 # ---------------------------------------------------------------- oylik prognoz va reja
+norm_name = _rep.norm_name
+
+
 def parse_agent_plans(text):
     """'Aziz=400000000; Bobur=350000000' -> {'aziz': 4e8, 'bobur': 3.5e8}"""
     out = {}
@@ -76,7 +93,7 @@ def parse_agent_plans(text):
         if "=" in part:
             k, v = part.split("=", 1)
             try:
-                out[k.strip().lower()] = float(re.sub(r"[^\d.]", "", v))
+                out[norm_name(k)] = float(re.sub(r"[^\d.]", "", v))
             except ValueError:
                 pass
     return out
@@ -105,21 +122,27 @@ def month_forecast(S, h, names, day, plan, stretch_pct=5.0, agent_plans=None):
                 pct=fc / plan if plan else 0, need_plan=need(plan), need_stretch=need(plan * (1 + sp)),
                 stretch_pct=stretch_pct, days_in=days_in)
 
-    ids = [a for a in (set(m["mtd_a"]) | set(S)) if m["mtd_a"].get(a, 0) > 0 or a in S]
     nm = lambda a: names.get(a) or (S[a]["name"] if a in S else str(a))
+    ids = [a for a in (set(m["mtd_a"]) | set(S))
+           if (m["mtd_a"].get(a, 0) > 0 or a in S) and norm_name(nm(a)) not in _rep.IGNORE]
     ap = {}
     for a in ids:
-        k = (nm(a) or "").lower()
+        k = norm_name(nm(a))
         if agent_plans and k in agent_plans:
             ap[a] = agent_plans[k]
     rest = [a for a in ids if a not in ap]
-    rest_plan = max(plan - sum(ap.values()), 0)
-    w = {a: m["prev_a"].get(a, 0) for a in rest}
-    if sum(w.values()) == 0:
-        w = {a: 1 for a in rest}
-    tw = sum(w.values()) or 1
-    for a in rest:
-        ap[a] = rest_plan * w[a] / tw
+    if agent_plans:
+        # Aniq agent rejalari berilgan bo'lsa, rejasi yo'q agentlarga reja BERILMAYDI (qolgan summa taqsimlanmaydi)
+        for a in rest:
+            ap[a] = 0
+    else:
+        # Aksincha, jamoa rejasi o'tgan oy ulushiga qarab bo'linadi
+        w = {a: m["prev_a"].get(a, 0) for a in rest}
+        if sum(w.values()) == 0:
+            w = {a: 1 for a in rest}
+        tw = sum(w.values()) or 1
+        for a in rest:
+            ap[a] = plan * w[a] / tw
     agents = {}
     for a in ids:
         a_mtd = m["mtd_a"].get(a, 0)
@@ -127,8 +150,10 @@ def month_forecast(S, h, names, day, plan, stretch_pct=5.0, agent_plans=None):
         a_fc = a_mtd + a_pace * rem
         a_plan = ap.get(a, 0)
         nd = lambda t: (max(t - a_mtd, 0) / rem) if rem else 0
-        agents[a] = dict(name=nm(a), mtd=a_mtd, pace=a_pace, forecast=a_fc, plan=a_plan,
-                         pct=(a_fc / a_plan) if a_plan else 0, need=nd(a_plan), need_stretch=nd(a_plan * (1 + sp)))
+        agents[a] = dict(name=nm(a), field=(nm(a) or "").strip().lower() not in _rep.NON_FIELD, mtd=a_mtd, pace=a_pace, forecast=a_fc, plan=a_plan,
+                         pct=(a_fc / a_plan) if a_plan else None, need=nd(a_plan), need_stretch=nd(a_plan * (1 + sp)))
+    team["plans_sum"] = sum(x["plan"] for x in agents.values())
+    team["auto_split"] = not agent_plans
     return {"team": team, "agents": agents}
 
 
@@ -154,13 +179,14 @@ def agent_month_text(s, mon, team_ticket):
 
 # ---------------------------------------------------------------- otkaz sabablari
 REASONS = [
-    ("tovar_yoq", r"tovar yo.?q|yo.?q tovar|нет в наличии|нет товара|налич|mavjud emas"),
+    ("assortiment", r"достаточно ассортимент|ассортимент.*достаточ|assortiment (yetarli|kifoya)|yetarli assortiment"),
+    ("raqobat", r"эксклюзив|конкурент|raqob|boshqa (dan|yetkaz)|другой постав|^\s*-\s*\S"),
+    ("tovar_yoq", r"tovar yo.?q|yo.?q tovar|нет в наличии|нет товара|mavjud emas"),
     ("qarz", r"qarz|долг|debt"),
     ("pul", r"\bpul\b|деньг|нет денег"),
     ("narx", r"narx|qimmat|цен|дорог|price"),
     ("ostatka", r"ostatka|zaxira|остаток|bor edi|\bbor\b|есть|sklad"),
     ("yopiq", r"yopiq|закрыт|closed|egasi yo.?q|kirib bo.?lmad|отсутств"),
-    ("raqobat", r"raqob|boshqa (dan|yetkaz)|конкур|другой постав"),
 ]
 
 REASON_PLAYBOOK = {
@@ -200,12 +226,20 @@ REASON_PLAYBOOK = {
                "Yopiq do'konga kun oxirida yana bir marta kirish qoidasini kiriting.",
                "Doimiy yopiq turadigan mijozlarni marshrutdan chiqarib, o'rniga yangi mijoz qo'shing."],
               "Yopiq do'konga kun oxirida qayta kiring va telefon orqali egasiga bog'laning."),
-    "raqobat": ("Boshqa yetkazib beruvchidan oladi",
-                "Mijoz raqobatchidan olyapti.",
-                ["Qaysi raqobatchi, qaysi tovarlar bo'yicha ekanini yig'ing.",
+    "raqobat": ("Raqobatchi / eksklyuziv shartnoma",
+                "Mijoz raqobatchidan oladi yoki raqobatchi bilan eksklyuziv shartnomasi bor.",
+                ["Eksklyuziv shartnomali do'konlar ro'yxatini ajrating: ularga vizit chastotasini kamaytirib, vaqtni boshqa mijozlarga yo'naltiring.",
+                 "Qaysi raqobatchi, qaysi tovarlar bo'yicha ekanini yig'ing.",
                  "Mijozga raqobatchida yo'q yoki bizda ustun bo'lgan tovarlarni taklif qilishni topshiring.",
                  "Yetkazib berish tezligi va ishonchliligini asosiy afzallik qilib ko'rsating."],
                 "Raqobatchida yo'q tovarlarni va yetkazib berish tezligimizni asosiy argument qiling."),
+    "assortiment": ("Mijoz 'assortiment yetarli' deydi",
+                    "Mijoz bizning mavjud tovarlarimizni yetarli deb hisoblaydi: agent yangi yoki kam sotiladigan tovarni ko'rsatmayapti yoki taklif mijozga foydali ko'rinmayapti.",
+                    ["Har vizitda mijoz polkasida bizda bor, lekin do'konda yo'q tovarlarni ko'rsating: 'Sizda X yo'q, qo'shsak ...' deb aniq pozitsiya taklif qiling.",
+                     "Har hafta jamoa uchun 2-3 ta 'fokus tovar' belgilang (yangi yoki kam sotiladigan) va hamma agent shuni taklif qilsin.",
+                     "Qo'shni do'konlarda eng yaxshi sotilayotgan tovarlarni misol qilib ko'rsating ('shu tovar yaqin do'konlarda tez ketyapti').",
+                     "Ikkilanayotgan mijozga kichik hajmli sinov zakas taklif qiling, keyingi vizitda natijani birga ko'ring."],
+                    "'Assortiment yetarli' desa, polkada yo'q bitta tovarni aniq ko'rsatib, kichik sinov zakas taklif qiling."),
     "boshqa": ("Boshqa sabablar",
                "Otkaz sababi aniq kategoriyaga tushmadi.",
                ["Agentlardan otkaz sababini aniq va to'liq yozishni talab qiling (faqat 'yo'q' emas).",
@@ -220,6 +254,13 @@ def classify(reason):
         if re.search(pat, r):
             return key
     return "boshqa"
+
+
+def classify_tags(reason):
+    """Sales Doctor'da otkaz sababi bir necha tanlov bo'lishi mumkin ('Есть долг,Нет денег,...'):
+    vergul bo'yicha ajratib, har birini alohida kategoriyaga qo'yadi. Qaytaradi: (kategoriyalar to'plami, tanlovlar soni)."""
+    tags = [t.strip() for t in (reason or "").split(",") if t.strip()]
+    return {classify(t) for t in tags}, len(tags)
 
 
 # ---------------------------------------------------------------- agent ko'rsatkichlari
@@ -242,13 +283,15 @@ def arrow(cur, base):
 
 
 def agent_metrics(S, h):
-    use_flag = any(s["with_order"] for s in S.values())
-    tot_vis = sum(s["visited"] for s in S.values())
-    tot_conv_n = sum((s["with_order"] if use_flag else len(s["order_clients"] - {None})) for s in S.values())
+    """Jamoa o'rtachalari faqat MAYDON agentlari bo'yicha (ofis savdosi hisobga olinmaydi)."""
+    F = [s for s in S.values() if s["field"]]
+    use_flag = any(s["with_order"] for s in F)
+    tot_vis = sum(s["visited"] for s in F)
+    tot_conv_n = sum((s["with_order"] if use_flag else len(s["order_clients"] - {None})) for s in F)
     team_conv = tot_conv_n / tot_vis if tot_vis else 0
-    tot_orders = sum(s["orders_n"] for s in S.values())
-    team_ticket = sum(s["orders_sum"] for s in S.values()) / tot_orders if tot_orders else 0
-    team_lines = sum(s["lines"] for s in S.values()) / tot_orders if tot_orders else 0
+    tot_orders = sum(s["orders_n"] for s in F)
+    team_ticket = sum(s["orders_sum"] for s in F) / tot_orders if tot_orders else 0
+    team_lines = sum(s["lines"] for s in F) / tot_orders if tot_orders else 0
     return use_flag, team_conv, team_ticket, team_lines
 
 
@@ -256,12 +299,35 @@ def issues_for(s, ctx, h, target):
     """Agent muammolari: (muhimlik, sarlavha, sabab, [qadamlar]). Eng muhimi birinchi."""
     use_flag, team_conv, team_ticket, team_lines = ctx
     out = []
+    if not s["field"]:
+        return out
     conv = conv_of(s, use_flag)
     vis_rate = s["visited"] / s["planned"] if s["planned"] else None
     first = s["first"]
     total_min = (s["last"] - s["first"]).total_seconds() / 60 if s["first"] else 0
 
-    if conv is not None and s["visited"] >= 5 and conv < target:
+    # vizitlar haqiqiyligi: soniyalik vizitlar, GPS yo'q, yopilmagan vizitlar
+    sus = (s["short"] >= 3) or (s["visited"] >= 5 and len(s["no_gps"]) / s["visited"] > 0.5)
+    if sus:
+        bits = []
+        if s["short"]:
+            bits.append(f"{s['short']} ta vizit 1 daqiqadan qisqa")
+        if s["visited"] and s["no_gps"]:
+            bits.append(f"{len(s['no_gps'])} / {s['visited']} vizit GPS siz")
+        if s["open_long"]:
+            bits.append(f"{s['open_long']} ta vizit {VISIT_CAP_MIN}+ daqiqa yopilmagan")
+        out.append((95, "Vizitlar haqiqiyligi shubhali: " + ", ".join(bits),
+                    "Do'konga bormasdan, ketma-ket soniyalarda vizit belgilangan bo'lishi mumkin. Bunday vizitlar hisobotdagi vizit sonini oshiradi, lekin savdo bermaydi.",
+                    ["Agent bilan suhbatlashing, nega GPS yoqilmaganini va vizitlar nega soniyalarda belgilanganini so'rang (telefon, internet yoki odat bo'lishi mumkin).",
+                     "Qoida: vizit faqat do'kon oldida GPS bilan ochiladi va yopiladi. GPS siz yoki 1 daqiqadan qisqa vizit hisobga olinmaydi.",
+                     "Supervayzer shu agentning bir necha do'koniga tasodifiy qo'ng'iroq qilib, bugun agent kelganini tasdiqlasin.",
+                     "Vizitni vaqtida yopish: kun oxirigacha ochiq qolgan vizitlar uchun ogohlantirish bering."]))
+    if conv is not None and s["visited"] >= 5 and conv < target and conv >= target * 0.85:
+        out.append((60, f"Zakas ulushi maqsadga yaqin, lekin hali past: {pct(conv)} (maqsad {pct(target)})",
+                    "Natija yomon emas, lekin yana bir-ikki do'kondan zakas olinsa maqsadga yetiladi.",
+                    ["Zakas bermagan do'konlarga kun oxirida qayta kirish yoki telefon qilish.",
+                     "Eng ko'p otkaz bergan do'konlarda sababni aniq yozib, keyingi vizitga tayyor taklif tayyorlash."]))
+    elif conv is not None and s["visited"] >= 5 and conv < target:
         gap = target - conv
         if vis_rate is None or vis_rate >= 0.85:
             out.append((90 + gap * 10,
@@ -329,12 +395,12 @@ def issues_for(s, ctx, h, target):
 
 
 # ---------------------------------------------------------------- agentlarga buyruq
-def agent_command(s, ctx, h, target, mon=None):
+def agent_command_body(s, ctx, h, target, mon=None):
+    """Agentga beriladigan buyruq matni (ismsiz)."""
     use_flag = ctx[0]
     conv = conv_of(s, use_flag)
-    name = E(s["name"])
     if not s["visited"]:
-        return f"• <b>{name}</b>: kecha vizit qayd etilmagan. Bugun rejadagi barcha mijozlarga kirib, GPS va foto bilan vizitni qayd eting."
+        return "kecha vizit qayd etilmagan. Bugun rejadagi barcha mijozlarga kirib, GPS va foto bilan vizitni qayd eting."
     parts = []
     base = max(s["planned"], s["visited"])
     if conv is not None and conv < target:
@@ -352,7 +418,23 @@ def agent_command(s, ctx, h, target, mon=None):
         parts.append("har vizitda foto va GPS majburiy")
     if mon and mon["plan"]:
         parts.append(f"oylik rejangiz {short(mon['plan'])}, bugun kamida {short(mon['need_stretch'])} so'm savdo qiling")
-    return f"• <b>{name}</b>: " + "; ".join(parts) + "."
+    return "; ".join(parts) + "."
+
+
+def agent_command(s, ctx, h, target, mon=None):
+    return f"• <b>{E(s['name'])}</b>: " + agent_command_body(s, ctx, h, target, mon)
+
+
+def command_items(S, ctx, h, target, month=None):
+    """Har bir maydon agenti uchun alohida buyruq: [{'id','name','body'}]"""
+    ag = (month or {}).get("agents", {})
+    items = []
+    for s in sorted(S.values(), key=lambda x: x["name"]):
+        if not s["field"]:
+            continue
+        body = agent_command_body(s, ctx, h, target, ag.get(s["id"]))
+        items.append({"id": s["id"], "name": s["name"], "body": body[:1].upper() + body[1:]})
+    return items
 
 
 def build_commands(S, day, h, ctx, target, month=None):
@@ -362,7 +444,8 @@ def build_commands(S, day, h, ctx, target, month=None):
             f"3) Otkaz bo'lsa sababini aniq yozing, foto va GPS ni unutmang.\n"
             f"Maqsad: zakas ulushi kamida {target * 100:.0f}% (kecha jamoada {pct(ctx[1])}).")
     ag = (month or {}).get("agents", {})
-    lines = [agent_command(s, ctx, h, target, ag.get(s["id"])) for s in sorted(S.values(), key=lambda x: x["name"])]
+    lines = [agent_command(s, ctx, h, target, ag.get(s["id"]))
+             for s in sorted(S.values(), key=lambda x: x["name"]) if s["field"]]
     return [head + "\n\n" + "\n".join(lines)]
 
 
@@ -384,21 +467,36 @@ def build_manager(S, idle, day, h, ctx, target, month=None):
         L.append(f"Prognoz: <b>{money(t['forecast'])}</b> ({t['pct'] * 100:.0f}%) {status(t['pct'])} · oxirgi hafta sur'ati bilan {money(t['forecast_recent'])}")
         if m["prev_total"]:
             L.append(f"O'tgan oyning shu davriga nisbatan: {arrow(t['mtd'], m['prev_total'])}")
+        if t.get("auto_split"):
+            L.append("⚠️ Bu oy uchun agent rejalari kiritilmagan: jamoa rejasi o'tgan oy ulushiga qarab taxminan bo'lingan.")
+        if t["plan"] and not t.get("auto_split") and abs(t["plans_sum"] - t["plan"]) / t["plan"] > 0.01:
+            L.append(f"⚠️ Agent rejalari yig'indisi {money(t['plans_sum'])}, jamoa rejasi {money(t['plan'])}: farq {money(t['plans_sum'] - t['plan'])}. Qaysi biri to'g'ri ekanini aniqlang.")
         gap_plan = max(t["plan"] - t["mtd"], 0)
         L.append(f"Rejaga yetish uchun: kuniga <b>{money(t['need_plan'])}</b> (hozir {money(t['pace'])}) · ziyod ({t['stretch_pct']:.0f}%+): kuniga <b>{money(t['need_stretch'])}</b>")
-        extra = max(t["need_stretch"] - t["pace"], 0)
-        n_ag = max(len([s for s in S.values() if s["visited"]]), 1)
+        ag_all = month["agents"].values()
+        field_pace = sum(x["pace"] for x in ag_all if x["field"])
+        other_pace = sum(x["pace"] for x in ag_all if not x["field"])
+        field_mtd = sum(x["mtd"] for x in ag_all if x["field"])
+        other_mtd = sum(x["mtd"] for x in ag_all if not x["field"])
+        if t["mtd"] and other_mtd:
+            L.append(f"🏢 Ofis/to'g'ridan-to'g'ri savdo oy savdosining {other_mtd / t['mtd'] * 100:.0f}% ini beradi ({short(other_mtd)}); maydon agentlari: {short(field_mtd)} (kuniga ~{short(field_pace)})")
+        # ofis sur'ati o'zgarmaydi deb, qolgan ziyodni maydon agentlari qoplaydi
+        need_field = max(t["need_stretch"] - other_pace, 0)
+        extra = max(need_field - field_pace, 0)
+        n_ag = max(len([s for s in S.values() if s["field"] and s["visited"]]), 1)
         if t["rem"] and extra > 0 and team_ticket:
-            L.append(f"\n🎯 <b>Ziyod bajarish uchun kuniga yana {money(extra)} so'm kerak.</b> Buni uch yo'l bilan qilish mumkin (biri yoki aralash):")
-            L.append(f"1) Zakas sonini oshirish: kuniga jami ~{math.ceil(extra / team_ticket)} ta zakas ko'proq (har agentga ~{math.ceil(extra / team_ticket / n_ag)} ta)")
-            if t["pace"]:
-                L.append(f"2) O'rtacha zakasni +{extra / t['pace'] * 100:.0f}% oshirish (hozir {money(team_ticket)} so'm): zakasga 1-2 qo'shimcha tovar")
-            tot_vis = sum(s["visited"] for s in S.values())
-            if tot_vis and team_conv:
-                need_c = team_conv * (t["need_stretch"] / t["pace"]) if t["pace"] else team_conv
+            L.append(f"\n🎯 <b>Ziyod bajarish uchun maydon agentlari kuniga yana {money(extra)} so'm sotishi kerak</b> (ofis hozirgi sur'atda deb hisoblanganda). Yo'llari (biri yoki aralash):")
+            L.append(f"1) Zakas sonini oshirish: kuniga jami ~{math.ceil(extra / team_ticket)} ta zakas ko'proq (har agentga ~{math.ceil(extra / team_ticket / n_ag)} ta, o'rtacha zakas {money(team_ticket)} so'm)")
+            if field_pace:
+                L.append(f"2) O'rtacha zakasni +{extra / field_pace * 100:.0f}% oshirish: zakasga 1-2 qo'shimcha tovar")
+            tot_vis = sum(s["visited"] for s in S.values() if s["field"])
+            if tot_vis and team_conv and field_pace:
+                need_c = team_conv * ((field_pace + extra) / field_pace)
                 L.append(f"3) Zakas ulushini {pct(team_conv)} dan {pct(min(need_c, 1.0))} ga ko'tarish" + (" (faqat shu yetmaydi, zakasni ham kattalashtirish kerak)" if need_c > 1 else ""))
             L.append("\nEng tez natija beradigan ishlar (ketma-ketlikda):")
             lv = []
+            if any((x["short"] >= 3 or (x["visited"] >= 5 and len(x["no_gps"]) / x["visited"] > 0.5)) for x in S.values() if x["field"]):
+                lv.append("Vizit haqiqiyligini tartibga solish: GPS majburiy, soniyalik vizitlar hisoblanmasin. Aks holda vizit soni haqiqiy ishni ko'rsatmaydi.")
             if team_conv < target:
                 lv.append(f"Zakas ulushini {target * 100:.0f}% ga yetkazish: har vizitda zakas qoidasi, zakas bermaganlarga kun oxirida qayta kirish.")
             if team_lines and team_lines < 3:
@@ -414,12 +512,39 @@ def build_manager(S, idle, day, h, ctx, target, month=None):
         L.append("\n📌 <b>Agentlar bo'yicha reja va prognoz</b>")
         for aid, a in sorted(month["agents"].items(), key=lambda kv: -kv[1]["forecast"]):
             sA = S.get(aid)
-            L.append(f"{status(a['pct'])} <b>{E(a['name'])}</b>: oy {short(a['mtd'])} · prognoz {short(a['forecast'])} / reja {short(a['plan'])} ({a['pct'] * 100:.0f}%)")
-            tx = agent_month_text(sA, a, team_ticket)
+            if not a["plan"]:
+                L.append(f"⚪ {'🏢 ' if not a['field'] else ''}<b>{E(a['name'])}</b>: oy {short(a['mtd'])} · prognoz {short(a['forecast'])} · reja belgilanmagan")
+                continue
+            L.append(f"{status(a['pct'])} {'🏢 ' if not a['field'] else ''}<b>{E(a['name'])}</b>: oy {short(a['mtd'])} · prognoz {short(a['forecast'])} / reja {short(a['plan'])} ({a['pct'] * 100:.0f}%)")
+            tx = agent_month_text(sA, a, team_ticket) if a["field"] else None
             if tx:
                 L.append(f"   Ziyod uchun kuniga {short(a['need_stretch'])} kerak (hozir {short(a['pace'])}): {E(tx)}")
     else:
         L.append("\n(Oylik reja kiritilmagan)")
+    # --- ofis / filiallar kesimi
+    if month:
+        for aid, ag in month["agents"].items():
+            if ag["field"]:
+                continue
+            cc = (h.get("cur_c") or {}).get(aid) or {}
+            pc = (h.get("prev_c") or {}).get(aid) or {}
+            if not cc:
+                continue
+            tot_c = sum(cc.values()) or 1
+            L.append(f"\n🏢 <b>{E(ag['name'])}: mijozlar (filial/ofis yuki) bo'yicha, oy boshidan</b>")
+            for cname, v in sorted(cc.items(), key=lambda kv: -kv[1])[:6]:
+                p = pc.get(cname, 0)
+                L.append(f"• {E(cname)}: {short(v)} ({v / tot_c * 100:.0f}%)"
+                         + (f" · o'tgan oyning shu davrida {short(p)} ({arrow(v, p)})" if p else " · o'tgan oyning shu davrida yuk bo'lmagan"))
+            if ag["plan"] and ag["pct"] is not None and ag["pct"] < 1:
+                L.append(f"Prognoz rejadan {short(ag['plan'] - ag['forecast'])} kam. Bu savdo agent harakatiga emas, filial va mijozlar buyurtmasiga bog'liq. Yechim:")
+                for n, st_ in enumerate([
+                        "Yuki pasaygan filialdan sababini so'rang: skladda ostatka yetarlimi yoki ularning o'z savdosi sustmi.",
+                        "Har filial o'z agentlarining oylik rejasiga mos yuk rejasini bersin (filial sotuv rejasi + zaxira = ofis yuk rejasi).",
+                        "Yuk ritmini belgilang (masalan haftada 2-3 aniq kun) va zavodga zakas berish jadvali bilan moslang, shunda tovar uzilmaydi.",
+                        "Filial skladlarida sust sotiladigan tovarlarni kamaytirib, tez sotiladiganlarni ko'proq yuklang."], 1):
+                    L.append(f"   {n}) {E(st_)}")
+
     # --- reyting
     L.append("\n🏆 <b>Agentlar reytingi</b> (savdo · zakas ulushi · oy boshidan)")
     ranked = sorted(S.values(), key=lambda x: -x["orders_sum"])
@@ -427,9 +552,9 @@ def build_manager(S, idle, day, h, ctx, target, month=None):
         cv = conv_of(s, use_flag)
         mt = m["mtd_a"].get(s["id"], 0)
         pm = m["prev_a"].get(s["id"], 0)
-        L.append(f"{i}. {E(s['name'])} — {money(s['orders_sum'])} · {pct(cv) if cv is not None else '—'} · oy: {money(mt)}"
+        L.append(f"{i}. {'🏢 ' if not s['field'] else ''}{E(s['name'])} — {money(s['orders_sum'])} · {pct(cv) if (cv is not None and s['field']) else '—'} · oy: {money(mt)}"
                  + (f" ({arrow(mt, pm)})" if pm else ""))
-    best = max((s for s in S.values() if conv_of(s, use_flag) is not None), key=lambda s: conv_of(s, use_flag), default=None)
+    best = max((s for s in S.values() if s["field"] and conv_of(s, use_flag) is not None), key=lambda s: conv_of(s, use_flag), default=None)
     if best and conv_of(best, use_flag) > team_conv + 0.1:
         L.append(f"💡 Eng yuqori zakas ulushi: {E(best['name'])} ({pct(conv_of(best, use_flag))}). Uning har bir do'kondagi ishlash usulini boshqalarga ko'rsating.")
 
@@ -460,14 +585,20 @@ def build_manager(S, idle, day, h, ctx, target, month=None):
 
     # --- otkaz sabablari
     cnt = defaultdict(int)
+    n_rej, n_tags = 0, 0
     for s in S.values():
         for _, r in s["rejects"]:
-            cnt[classify(r)] += 1
+            cats, k_tags = classify_tags(r)
+            n_rej += 1
+            n_tags += k_tags
+            for c in cats:
+                cnt[c] += 1
     if cnt:
-        L.append("\n🚫 <b>Otkaz sabablari (jamoa)</b>")
-        total = sum(cnt.values())
+        L.append(f"\n🚫 <b>Otkaz sabablari (jamoa, {n_rej} ta otkazli vizit)</b>")
         for k, n in sorted(cnt.items(), key=lambda x: -x[1]):
-            L.append(f"• {E(REASON_PLAYBOOK[k][0])}: {n} ta ({n * 100 // total}%)")
+            L.append(f"• {E(REASON_PLAYBOOK[k][0])}: {n} ta vizitda ({n * 100 // n_rej}%)")
+        if n_rej and n_tags / n_rej >= 2.5:
+            L.append(f"⚠️ Bir otkazda o'rtacha {n_tags / n_rej:.1f} ta sabab belgilangan: sabablar formal belgilanayotgan bo'lishi mumkin. Agentdan faqat bitta ASOSIY sababni tanlashni talab qiling, aks holda tahlil aniq bo'lmaydi.")
         top = max(cnt, key=cnt.get)
         name, cause, steps, cmd = REASON_PLAYBOOK[top]
         L.append(f"Eng ko'p sabab: <b>{E(name)}</b>. {E(cause)}")
