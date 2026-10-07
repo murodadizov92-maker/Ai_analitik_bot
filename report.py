@@ -5,7 +5,25 @@ import io
 from collections import defaultdict
 
 
+# Maydonda ishlamaydigan 'agentlar' (ofis, to'g'ridan-to'g'ri savdo): vizit KPI va agent tahlilidan chiqariladi
+NON_FIELD = {"ofis"}
+IGNORE = set()   # ishdan ketgan agentlar (normallashtirilgan ismlar): ro'yxatlarda ko'rsatilmaydi
+
+SHIP_FILTER = "dateLoad"      # "yuk chiqqan" sanasi: getOrder filtri (hujjat/otgruzka sanasi)
+SHIP_STATUSES = [2, 3, 4]    # yuborilgan, yetkazilgan, yopilgan
+VISIT_CAP_MIN = 90      # bundan uzoq yozilgan vizit yopilmay qolgan hisoblanadi
+SHORT_VISIT_SEC = 60    # bundan qisqa vizit shubhali hisoblanadi
+
+
 # ---------------------------------------------------------------- yordamchilar
+def norm_name(x):
+    """Ismlarni solishtirish uchun: kichik harf, ortiqcha probellar va qavs ichidagi probellar olib tashlanadi."""
+    import re
+    x = re.sub(r"\s+", " ", (x or "").strip().lower())
+    x = re.sub(r"\(\s+", "(", x)
+    return re.sub(r"\s+\)", ")", x)
+
+
 def money(x):
     return f"{x:,.0f}".replace(",", " ")
 
@@ -45,12 +63,15 @@ def sid(obj):
 
 
 # ---------------------------------------------------------------- ma'lumot yig'ish
-async def collect(client, day, statuses):
-    d = str(day)
-    per = {"period": {"date": {"from": d, "to": d}}}
+async def collect(client, d_from, d_to, statuses):
+    """d_from..d_to oralig'i bo'yicha (bir kun uchun d_from == d_to)."""
+    per = {"period": {"date": {"from": str(d_from), "to": str(d_to)}}}
     agents = await client.paginate("getAgent", {}, "agent")
     visits = await client.paginate("getVisit", {"filter": per}, "visit")
     orders = await client.paginate("getOrder", {"filter": {"agent": "all", "status": statuses, **per}}, "order")
+    shipped = await client.paginate(
+        "getOrder", {"filter": {"agent": "all", "status": SHIP_STATUSES,
+                                "period": {SHIP_FILTER: {"from": str(d_from), "to": str(d_to)}}}}, "order")
     pays = await client.paginate("getPayment", {"filter": {"transactionType": 3, **per}}, "payment")
     defects = await client.paginate("getOrderDefect", {"filter": {"status": statuses, **per}}, "order")
     ptypes = await client.paginate("getPaymentType", {}, "currency")
@@ -79,13 +100,13 @@ async def collect(client, day, statuses):
         for p in await client.paginate("getProduct", {}, "product"):
             pnames.setdefault(p["SD_id"], p.get("name") or p["SD_id"])
 
-    return {"day": day, "agents": agents, "visits": visits, "orders": orders, "pays": pays,
+    return {"day": d_to, "d_from": d_from, "agents": agents, "visits": visits, "orders": orders, "shipped": shipped, "pays": pays,
             "defects": defects, "ptypes": ptypes, "cnames": cnames, "pnames": pnames}
 
 
 # ---------------------------------------------------------------- hisoblash
 def new_stat(name, aid=None):
-    return {"id": aid, "with_order": 0, "order_clients": set(), "lines": 0, "no_order_clients": [], "name": name, "planned": 0, "visited": 0, "gps": 0, "photo": 0, "no_photo": [], "no_gps": [],
+    return {"ship_n": 0, "ship_sum": 0.0, "days": set(), "field": (name or "").strip().lower() not in NON_FIELD, "short": 0, "open_long": 0, "id": aid, "with_order": 0, "order_clients": set(), "lines": 0, "no_order_clients": [], "name": name, "planned": 0, "visited": 0, "gps": 0, "photo": 0, "no_photo": [], "no_gps": [],
             "first": None, "last": None, "in_visit": 0.0, "durs": [], "iv": [], "rejects": [],
             "orders_n": 0, "orders_sum": 0.0, "pay_sum": 0.0, "pay_by": defaultdict(float), "pays": [],
             "ret_n": 0, "ret_sum": 0.0, "rets": []}
@@ -123,17 +144,30 @@ def summarize(data):
                 s["no_gps"].append(client)
             a, b = pdt(v.get("start_date")), pdt(v.get("end_date"))
             if a:
+                s["days"].add(a.date())
                 s["first"] = a if not s["first"] else min(s["first"], a)
-                end = b if b and b >= a else a
-                s["last"] = end if not s["last"] else max(s["last"], end)
+                end = a
                 if b and b > a:
-                    s["durs"].append((b - a).total_seconds() / 60)
+                    d = (b - a).total_seconds()
+                    if d < SHORT_VISIT_SEC:
+                        s["short"] += 1
+                    if d > VISIT_CAP_MIN * 60:
+                        s["open_long"] += 1
+                        d = VISIT_CAP_MIN * 60
+                    end = a + dt.timedelta(seconds=d)
+                    s["durs"].append(d / 60)
+                s["last"] = end if not s["last"] else max(s["last"], end)
                 s["iv"].append((a, end))
     for s in S.values():
-        s["in_visit"] = sum(s["durs"])
-        iv = sorted(s["iv"])
-        s["max_gap"] = max([(iv[i + 1][0] - iv[i][1]).total_seconds() / 60 for i in range(len(iv) - 1)] or [0])
-        s["max_gap"] = max(s["max_gap"], 0)
+        merged = []
+        for a_, b_ in sorted(s["iv"]):
+            if merged and a_ <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], b_)
+            else:
+                merged.append([a_, b_])
+        s["in_visit"] = sum((b_ - a_).total_seconds() for a_, b_ in merged) / 60
+        gaps = [(merged[i + 1][0] - merged[i][1]).total_seconds() / 60 for i in range(len(merged) - 1)]
+        s["max_gap"] = max(gaps or [0])
 
     for o in data["orders"]:
         s = st(sid(o.get("agent")))
@@ -141,6 +175,11 @@ def summarize(data):
         s["order_clients"].add(sid(o.get("client")))
         s["lines"] += len(o.get("orderProducts") or [])
         s["orders_sum"] += float(o.get("totalSummaAfterDiscount") or o.get("totalSumma") or 0)
+
+    for o in data.get("shipped", []):
+        s = st(sid(o.get("agent")))
+        s["ship_n"] += 1
+        s["ship_sum"] += float(o.get("totalSummaAfterDiscount") or o.get("totalSumma") or 0)
 
     for p in data["pays"]:
         s = st(sid(p.get("agent")), "Agentsiz (kassa)")
@@ -160,36 +199,51 @@ def summarize(data):
 
     # faol, lekin bugun hech narsa qilmagan agentlar
     idle = [a.get("name") or a["SD_id"] for a in data["agents"]
-            if a.get("active", "Y") != "N" and a["SD_id"] not in S]
+            if a.get("active", "Y") != "N" and a["SD_id"] not in S and norm_name(a.get("name")) not in IGNORE]
     return S, idle
 
 
 # ---------------------------------------------------------------- Telegram matni
 def warnings(s):
     w = []
-    if s["planned"] and s["visited"] / s["planned"] < 0.6:
+    if s["field"] and s["planned"] and s["visited"] / s["planned"] < 0.6:
         w.append(f"reja bajarilishi {s['visited'] * 100 // s['planned']}%")
+    if not s["field"]:
+        return w
     if s["no_photo"]:
         w.append(f"{len(s['no_photo'])} ta vizitda foto otchyot yo'q")
     if s["no_gps"]:
         w.append(f"{len(s['no_gps'])} ta vizit GPS bilan tasdiqlanmagan")
-    if not s["visited"] and (s["orders_n"] or s["pay_sum"]):
+    if s["short"] >= 3:
+        w.append(f"{s['short']} ta vizit 1 daqiqadan qisqa (haqiqiyligi shubhali)")
+    if s["open_long"]:
+        w.append(f"{s['open_long']} ta vizit yopilmay qolgan ({VISIT_CAP_MIN}+ daq)")
+    if s["field"] and not s["visited"] and (s["orders_n"] or s["pay_sum"]):
         w.append("vizitsiz buyurtma/to'lov bor")
     return w
 
 
-def agent_block(s, limit=5, mon=None):
+def agent_block(s, limit=5, mon=None, multi=False):
     e = lambda x: html.escape(str(x), quote=False)
-    L = [f"👤 <b>{e(s['name'])}</b>"]
+    L = [f"{'👤' if s['field'] else '🏢'} <b>{e(s['name'])}</b>" + ("" if s["field"] else " (filiallarga yuk / ofis savdosi)")]
     plan = f" / reja {s['planned']}" if s["planned"] else ""
-    L.append(f"🚶 Vizit: <b>{s['visited']}</b>{plan} · GPS: {s['gps']} · Foto: {s['photo']}")
-    if s["first"]:
+    if s["field"] or s["visited"]:
+        L.append(f"🚶 Vizit: <b>{s['visited']}</b>{plan} · GPS: {s['gps']} · Foto: {s['photo']}")
+    if multi and s["field"] and s["days"]:
+        L.append(f"📆 Ish kunlari: {len(s['days'])} · kuniga o'rtacha {s['visited'] / len(s['days']):.0f} vizit · "
+                 f"vizitlarda jami {fmt_min(s['in_visit'])}")
+    if s["first"] and s["field"] and not multi:
         total = (s["last"] - s["first"]).total_seconds() / 60
         avg = f" · o'rtacha vizit {fmt_min(sum(s['durs']) / len(s['durs']))}" if s["durs"] else ""
         L.append(f"⏱ Ish vaqti: {s['first']:%H:%M} – {s['last']:%H:%M} ({fmt_min(total)})")
         L.append(f"   Vizitlarda: {fmt_min(s['in_visit'])}{avg} · eng uzoq tanaffus: {fmt_min(s['max_gap'])}")
+        if s["short"] or s["open_long"]:
+            L.append(f"   ⚠️ 1 daqiqadan qisqa vizit: {s['short']} ta · yopilmay qolgan: {s['open_long']} ta")
     L.append(f"🛒 Buyurtma: <b>{s['orders_n']}</b> ta · {money(s['orders_sum'])} so'm")
-    if mon:
+    L.append(f"🚚 Yuk chiqqan: <b>{s['ship_n']}</b> ta · {money(s['ship_sum'])} so'm")
+    if mon and not mon["plan"]:
+        L.append(f"📈 Oy: {short(mon['mtd'])} · prognoz <b>{short(mon['forecast'])}</b> · reja belgilanmagan")
+    elif mon:
         L.append(f"📈 Oy: {short(mon['mtd'])} · prognoz <b>{short(mon['forecast'])}</b> / reja {short(mon['plan'])} "
                  f"({mon['pct'] * 100:.0f}%) {status(mon['pct'])}")
         L.append(f"   Reja uchun kuniga {short(mon['need'])} kerak (hozir {short(mon['pace'])}); "
@@ -216,17 +270,20 @@ def agent_block(s, limit=5, mon=None):
     return "\n".join(L)
 
 
-def build_messages(S, idle, day, month=None, limit=3900):
+def build_messages(S, idle, day, month=None, limit=3900, label=None, title="Agentlar hisoboti", multi=False):
     tot = defaultdict(float)
     for s in S.values():
         tot["planned"] += s["planned"]; tot["visited"] += s["visited"]
         tot["orders_n"] += s["orders_n"]; tot["orders_sum"] += s["orders_sum"]
         tot["pay"] += s["pay_sum"]; tot["ret_n"] += s["ret_n"]; tot["ret_sum"] += s["ret_sum"]
         tot["rej"] += len(s["rejects"])
-    head = (f"📊 <b>Agentlar hisoboti — {day:%d.%m.%Y}</b>\n"
-            f"Agentlar: {len(S)} ta ishladi · Vizit: {int(tot['visited'])}"
+        tot["ship"] += s["ship_sum"]; tot["ship_n"] += s["ship_n"]
+    head = (f"📊 <b>{html.escape(title)} — {label or format(day, '%d.%m.%Y')}</b>\n"
+            f"Agentlar: {sum(1 for x in S.values() if x['field'])} ta ishladi"
+            + (" + ofis" if any(not x["field"] for x in S.values()) else "") + f" · Vizit: {int(tot['visited'])}"
             + (f" / reja {int(tot['planned'])}" if tot["planned"] else "") + "\n"
             f"🛒 Savdo: <b>{money(tot['orders_sum'])}</b> so'm ({int(tot['orders_n'])} ta buyurtma)\n"
+            f"🚚 Yuk chiqqan: <b>{money(tot['ship'])}</b> so'm ({int(tot['ship_n'])} ta)\n"
             f"💵 Tushgan pul: <b>{money(tot['pay'])}</b> so'm\n"
             f"↩️ Vozvrat: {money(tot['ret_sum'])} so'm ({int(tot['ret_n'])} ta)\n"
             f"🚫 Otkaz: {int(tot['rej'])} ta")
@@ -241,7 +298,7 @@ def build_messages(S, idle, day, month=None, limit=3900):
                  f"Oy oxirigacha {t['rem']} ish kuni qoldi")
     blocks = [head]
     for s in sorted(S.values(), key=lambda x: -x["orders_sum"]):
-        blocks.append(agent_block(s, mon=(month or {}).get("agents", {}).get(s["id"])))
+        blocks.append(agent_block(s, mon=(month or {}).get("agents", {}).get(s["id"]), multi=multi))
     if idle:
         blocks.append("😴 <b>Hech qanday faoliyat yo'q:</b> " + html.escape(", ".join(idle), quote=False))
     msgs, cur = [], ""
@@ -264,13 +321,13 @@ def make_excel(S, data, day):
     ws = wb.active
     ws.title = "Xulosa"
     ws.append(["Agent", "Reja", "Vizit", "GPS", "Foto", "Boshlagan", "Tugatgan", "Ish vaqti (daq)", "Vizitda (daq)",
-               "Buyurtma soni", "Savdo (so'm)", "Tushgan pul (so'm)", "Vozvrat soni", "Vozvrat (so'm)", "Otkaz soni"])
+               "Buyurtma soni", "Savdo (so'm)", "Tushgan pul (so'm)", "Vozvrat soni", "Vozvrat (so'm)", "Otkaz soni", "Yuk soni", "Yuk chiqqan (so'm)"])
     for s in sorted(S.values(), key=lambda x: -x["orders_sum"]):
         tot = round((s["last"] - s["first"]).total_seconds() / 60) if s["first"] else 0
         ws.append([s["name"], s["planned"], s["visited"], s["gps"], s["photo"],
                    f"{s['first']:%H:%M}" if s["first"] else "", f"{s['last']:%H:%M}" if s["last"] else "",
                    tot, round(s["in_visit"]), s["orders_n"], s["orders_sum"], s["pay_sum"],
-                   s["ret_n"], s["ret_sum"], len(s["rejects"])])
+                   s["ret_n"], s["ret_sum"], len(s["rejects"]), s["ship_n"], s["ship_sum"]])
     w2 = wb.create_sheet("Vizitlar")
     w2.append(["Agent", "Mijoz", "Boshlandi", "Tugadi", "Rejada", "Bo'ldi", "GPS", "Foto", "Buyurtma", "Summa", "Otkaz sababi"])
     names = {a["SD_id"]: a.get("name") for a in data["agents"]}
