@@ -10,10 +10,6 @@ def mln(x):
     return f"{x / 1e6:.0f}" if abs(x) >= 1e9 else f"{x / 1e6:.1f}"
 
 
-def row(mark, name, plan, zakas, pct, ship, pay):
-    return f"{mark}{name:<10} {plan:>6} {zakas:>6} {pct:>4} {ship:>6} {pay:>6}"
-
-
 async def collect_pays(client, first, day):
     pays = await client.paginate(
         "getPayment", {"filter": {"transactionType": 3, "period": {"date": {"from": str(first), "to": str(day)}}}}, "payment")
@@ -36,102 +32,95 @@ async def collect_ship(client, first, day, statuses, date_filter):
     return out
 
 
+def bar(p, width=10):
+    n = max(0, min(width, int(round(p * width))))
+    return "▰" * n + "▱" * (width - n)
+
+
+def pct_s(x):
+    return f"{x * 100:.0f}%"
+
+
+def card(aid, a, ship, pays):
+    """Bitta agent kartochkasi: oddiy so'zlar bilan."""
+    e = lambda x: html.escape(str(x), quote=False)
+    z, y, p = a["mtd"], ship.get(aid, 0), pays.get(aid, 0)
+    L = [f"<b>{e(a['name'])}</b>" + (f" · reja {short(a['plan'])}" if a["plan"] else " · reja belgilanmagan")]
+    if a["plan"]:
+        L.append(f"Zakas: <b>{short(z)}</b> ({pct_s(z / a['plan'])})  {bar(z / a['plan'])}")
+    else:
+        L.append(f"Zakas: <b>{short(z)}</b>")
+    L.append(f"Yuk chiqqan: {short(y)} · Pul tushgan: {short(p)}")
+    if a["plan"]:
+        gap = a["plan"] - a["forecast"]
+        L.append(f"Oy oxirigacha prognoz: <b>{short(a['forecast'])}</b> ({pct_s(a['pct'])})"
+                 + (f", kamomad ~{short(gap)}" if gap > 0 else ""))
+        if a["pct"] < 1:
+            L.append(f"Reja uchun kuniga <b>{short(a['need'])}</b> kerak (hozir {short(a['pace'])})")
+        else:
+            L.append("Tempni saqlasa, reja bajariladi")
+    if z and y / z < 0.9:
+        L.append(f"⚠️ Yuk orqada: zakasning {pct_s(y / z)} i chiqqan")
+    if y and p / y < 0.5:
+        L.append(f"⚠️ Pul kam tushgan: chiqqan yukning {pct_s(p / y)} i")
+    elif y and p > y * 1.2:
+        L.append("💵 Pul yukdan ko'p: oldingi qarzlar ham yig'ilgan")
+    return "\n".join(L)
+
+
 def build(month, pays, ship, day, title):
-    """month: analysis.month_forecast natijasi; pays: {agent_id: tushgan pul}. Qaytaradi: [xabar matnlari]"""
+    """month: analysis.month_forecast natijasi; pays/ship: {agent_id: summa}. Qaytaradi: [xabar matnlari]"""
     e = lambda x: html.escape(str(x), quote=False)
     t = month["team"]
     ag = sorted(month["agents"].items(), key=lambda kv: -(kv[1]["plan"] or kv[1]["mtd"]))
     tot_plan = sum(a["plan"] for _, a in ag)
-    tot_sales = sum(a["mtd"] for _, a in ag)
-    tot_pay = sum(pays.get(aid, 0) for aid, _ in ag)
-    tot_ship = sum(ship.get(aid, 0) for aid, _ in ag)
+    tot_z = sum(a["mtd"] for _, a in ag)
+    tot_y = sum(ship.get(aid, 0) for aid, _ in ag)
+    tot_p = sum(pays.get(aid, 0) for aid, _ in ag)
 
-    head = (f"📊 <b>{e(title)}: natija, {day.replace(day=1):%d.%m} dan {day:%d.%m.%Y} gacha</b>\n"
-            f"Oyning {t['worked']} ish kuni o'tdi, {t['rem']} qoldi · summalar mln so'mda\n"
-            "Zakas = agentlar olgan buyurtmalar · Yuk = ombordan chiqqan (yetkazishga) · Pul = tushgan pul")
-    rows = ["  " + f"{'Agent':<10} {'Reja':>6} {'Zakas':>6} {'%':>4} {'Yuk':>6} {'Pul':>6}"]
-    for aid, a in ag:
-        fc = status(a["pct"]) if a["plan"] else "⚪"
-        rows.append(row(fc, a["name"].split("(")[0].strip()[:10], mln(a["plan"]) if a["plan"] else "—", mln(a["mtd"]),
-                        f"{a['mtd'] / a['plan'] * 100:.0f}%" if a["plan"] else "—", mln(ship.get(aid, 0)), mln(pays.get(aid, 0))))
-    rows.append("—" * 42)
-    rows.append(row("  ", "JAMI", mln(tot_plan), mln(tot_sales), f"{tot_sales / tot_plan * 100:.0f}%" if tot_plan else "—",
-                    mln(tot_ship), mln(tot_pay)))
-    table = "<pre>" + e("\n".join(rows)) + "</pre>"
+    parts = [f"📊 <b>{e(title)} — oy natijasi</b>\n"
+             f"📅 {day.replace(day=1):%d.%m} – {day:%d.%m.%Y} · {t['worked']} ish kuni o'tdi, {t['rem']} qoldi"]
 
-    green, yellow, red = [], [], []
+    tot = ["🏁 <b>UMUMIY</b>"]
+    if tot_plan:
+        tot.append(f"Reja: <b>{short(tot_plan)}</b>")
+        tot.append(f"Zakas (olingan buyurtmalar): <b>{short(tot_z)}</b> — {pct_s(tot_z / tot_plan)}  {bar(tot_z / tot_plan)}")
+    else:
+        tot.append(f"Zakas (olingan buyurtmalar): <b>{short(tot_z)}</b>")
+    tot.append(f"Yuk chiqqan (yetkazishga): <b>{short(tot_y)}</b>")
+    tot.append(f"Pul tushgan: <b>{short(tot_p)}</b>")
+    if t["plan"]:
+        tot.append(f"📈 Oy oxirigacha prognoz: <b>{short(t['forecast'])}</b> ({pct_s(t['pct'])}) {status(t['pct'])}")
+    parts.append("\n".join(tot))
+
+    groups = {"red": [], "yellow": [], "green": [], "none": []}
     for aid, a in ag:
         if not a["plan"]:
-            continue
-        line = (f"<b>{e(a['name'])}</b>: prognoz {short(a['forecast'])} / reja {short(a['plan'])} ({a['pct'] * 100:.0f}%)")
-        if a["pct"] >= 1:
-            green.append(line + " · tempni saqlasa reja bajariladi")
+            groups["none"].append((aid, a))
+        elif a["pct"] >= 1:
+            groups["green"].append((aid, a))
         elif a["pct"] >= 0.85:
-            yellow.append(line + f" · kuniga {short(a['need'])} kerak (hozir {short(a['pace'])})")
+            groups["yellow"].append((aid, a))
         else:
-            red.append(line + f" · kuniga {short(a['need'])} kerak (hozir {short(a['pace'])}), kamomad ~{short(a['plan'] - a['forecast'])}")
-    parts = [head, table]
+            groups["red"].append((aid, a))
+    titles = {"red": "🔴 <b>XAVF — tezkor chora kerak</b>", "yellow": "🟡 <b>DIQQAT — ozgina yetmayapti</b>",
+              "green": "🟢 <b>YAXSHI — reja bajarilmoqda</b>", "none": "⚪ <b>REJASIZ</b>"}
+    for k in ("red", "yellow", "green", "none"):
+        if groups[k]:
+            parts.append(titles[k] + "\n\n" + "\n\n".join(card(aid, a, ship, pays) for aid, a in groups[k]))
+
     if t["plan"]:
-        parts.append(f"📈 <b>Jamoa prognozi:</b> {short(t['forecast'])} / reja {short(t['plan'])} ({t['pct'] * 100:.0f}%) {status(t['pct'])}")
-        parts.append("<b>Reja bo'yicha holat</b>")
-    if green:
-        parts.append("🟢 Reja bajarilmoqda:\n" + "\n".join("• " + g for g in green))
-    if yellow:
-        parts.append("🟡 Diqqat, ozgina yetmayapti:\n" + "\n".join("• " + y for y in yellow))
-    if red:
-        parts.append("🔴 Xavf, tezkor chora kerak:\n" + "\n".join("• " + r for r in red))
-    if not (green or yellow or red):
-        parts.append("Bu filial uchun oylik agent rejalari kiritilmagan, shuning uchun reja foizi ko'rsatilmadi.")
-
-    # yuk chiqishi: zakasning qancha qismi ombordan chiqqan
-    sg, sy, sr = [], [], []
-    for aid, a in ag:
-        if not a["mtd"]:
-            continue
-        ratio = ship.get(aid, 0) / a["mtd"]
-        line = f"<b>{e(a['name'])}</b>: zakas {mln(a['mtd'])} · yuk {mln(ship.get(aid, 0))} ({ratio * 100:.0f}%)"
-        (sg if ratio >= 0.9 else sy if ratio >= 0.75 else sr).append(line)
-    sh = []
-    if sg:
-        sh.append("🟢 Zakaslar o'z vaqtida chiqmoqda:\n" + "\n".join("• " + x for x in sg))
-    if sy:
-        sh.append("🟡 Yuk biroz orqada:\n" + "\n".join("• " + x for x in sy))
-    if sr:
-        sh.append("🔴 Zakas olingan, lekin yuk chiqmagan (yetkazilmay qolgan):\n" + "\n".join("• " + x for x in sr))
-    if sh:
-        parts.append("🚚 <b>Yuk chiqishi</b> (chiqqan yuk / zakas)\n" + "\n\n".join(sh))
-
-    cg, cy, cr = [], [], []
-    for aid, a in ag:
-        base = ship.get(aid, 0) or a["mtd"]
-        if not base:
-            continue
-        ratio = pays.get(aid, 0) / base
-        s_ = f"<b>{e(a['name'])}</b>: pul {mln(pays.get(aid, 0))} / yuk {mln(base)} ({ratio * 100:.0f}%)"
-        (cg if ratio >= 0.8 else cy if ratio >= 0.5 else cr).append(s_)
-    cash = []
-    if cg:
-        cash.append("🟢 Pul yaxshi tushmoqda:\n" + "\n".join("• " + x for x in cg))
-    if cy:
-        cash.append("🟡 O'rtacha:\n" + "\n".join("• " + x for x in cy))
-    if cr:
-        cash.append("🔴 Yuk chiqdi, pul kam kelgan:\n" + "\n".join("• " + x for x in cr))
-    if cash:
-        parts.append("💵 <b>Pul kelishi</b> (tushgan pul / chiqqan yuk)\n" + "\n\n".join(cash))
-
-    # asosiy xulosa
-    worst = max(((a["plan"] - a["forecast"], a["name"]) for _, a in ag if a["plan"]), default=(0, ""), key=lambda x: x[0])
-    if not t["plan"]:
-        pass
-    elif worst[0] > 0:
-        parts.append(f"🎯 <b>Asosiy xulosa:</b> eng katta kamomad — {e(worst[1])} (~{short(worst[0])}). "
-                     f"Rejaga yetish uchun jami kuniga {short(t['need_plan'])} kerak, hozir {short(t['pace'])}.")
+        worst = max(((a["plan"] - a["forecast"], a["name"]) for _, a in ag if a["plan"]), default=(0, ""), key=lambda x: x[0])
+        if worst[0] > 0:
+            parts.append(f"🎯 <b>Xulosa:</b> eng katta kamomad — <b>{e(worst[1])}</b> (~{short(worst[0])}). "
+                         f"Rejaga yetish uchun jami kuniga <b>{short(t['need_plan'])}</b> kerak, hozir {short(t['pace'])}.")
+        else:
+            parts.append("🎯 <b>Xulosa:</b> hozirgi sur'at bilan reja bajariladi. Sur'atni tushirmang.")
     else:
-        parts.append("🎯 <b>Asosiy xulosa:</b> hozirgi sur'at bilan reja bajariladi. Sur'atni tushirmang.")
-    text = "\n\n".join(parts)
-    # 4096 chegarasi uchun bo'lish
+        parts.append("ℹ️ Bu filial uchun oylik agent rejalari kiritilmagan, shuning uchun reja foizi va prognoz ko'rsatilmadi.")
+
     out, cur = [], ""
-    for blk in text.split("\n\n"):
+    for blk in "\n\n".join(parts).split("\n\n"):
         if cur and len(cur) + len(blk) + 2 > 3900:
             out.append(cur)
             cur = ""
